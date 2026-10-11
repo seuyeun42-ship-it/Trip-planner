@@ -154,10 +154,9 @@ dialog form{display:flex;flex-direction:column;gap:12px}
 <div class="app">
   <header class="top">
     <div class="trow" id="spaceRow" hidden>
-      <select id="spaceSel" aria-label="여행 묶음"></select>
-      <button class="btn" id="btnSpEdit" type="button">묶음 이름</button>
-      <button class="btn" id="btnSpNew" type="button">새 묶음</button>
-      <button class="btn pri" id="btnShare" type="button">친구 초대 링크</button>
+      <select id="spaceSel" aria-label="내 여행 목록"></select>
+      <button class="btn pri" id="btnShare" type="button">이 여행 초대 링크</button>
+      <button class="btn" id="btnHome" type="button">내 목록 옮기기</button>
     </div>
     <div class="trow">
       <select id="tripSel" aria-label="여행 선택"></select>
@@ -165,6 +164,7 @@ dialog form{display:flex;flex-direction:column;gap:12px}
       <button class="btn" id="btnXls" type="button" hidden>엑셀로 내보내기</button>
       <button class="btn" id="btnNew" type="button">새 여행</button>
       <button class="btn" id="btnImp" type="button">가져오기</button>
+      <button class="btn" id="btnSplit" type="button" hidden>이 여행만 따로 떼기</button>
     </div>
     <h1 id="tName">여행 동선 노트</h1>
     <p id="tMeta">여행을 불러오는 중…</p>
@@ -261,11 +261,11 @@ dialog form{display:flex;flex-direction:column;gap:12px}
   </form>
 </dialog>
 
-<dialog id="dlgSpace"><h2 id="dlgSpaceH">새 묶음</h2>
-  <form id="fSpace">
-    <p class="hint">묶음은 여행을 담는 폴더입니다. 묶음마다 초대 링크가 따로 있어서, 링크를 받은 사람은 그 묶음의 여행만 봅니다.</p>
-    <label class="fld">묶음 이름<input id="spName" required maxlength="40" placeholder="예: 도쿄 친구들"></label>
-    <div class="dact"><button class="btn" type="button" data-close>취소</button><button class="btn pri">저장</button></div>
+<dialog id="dlgHome"><h2>내 목록 옮기기</h2>
+  <form method="dialog">
+    <p class="hint">다른 기기에서 내 여행 목록을 그대로 보려면, 그 기기에서 이 링크를 한 번 여세요. 이 링크는 본인만 쓰세요. 받은 사람은 내 여행을 전부 보게 됩니다.</p>
+    <input id="hmLink" readonly aria-label="내 목록 링크">
+    <div class="dact"><button class="btn" type="button" data-close>닫기</button><button class="btn pri" id="hmCopy" type="button">복사</button></div>
   </form>
 </dialog>
 
@@ -418,11 +418,15 @@ async function boot(){
   dl={save:async({filename,data})=>{ const a=document.createElement('a'), u=URL.createObjectURL(data instanceof Blob?data:new Blob([data])); a.href=u; a.download=filename; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(u),4000); return {status:'saved'}; }};
   if(FIREBASE_CONFIG&&window.firebase){
     try{
-      loadSpaces(); space=hashCode()||ls.get('space')||(spaces[0]&&spaces[0].c)||newCode();
-      addSpace(space); ls.set('space',space); setHash();
       firebase.initializeApp(FIREBASE_CONFIG); const f=firebase.firestore();
+      fdoc=(sp,p)=>f.doc('spaces/'+sp+'/'+p);
       db={collection:n=>f.collection('spaces/'+space+'/'+n), doc:p=>f.doc('spaces/'+space+'/'+p)};
-      renderSpaces(); window.addEventListener('hashchange',()=>{ const c=hashCode(); if(c&&c!==space) switchSpace(c); });
+      loadSpaces(); const h=hashGet('h'), s1=hashGet('s');
+      if(h&&h!==ls.get('home')) ls.set('homeSynced',''); home=h||ls.get('home')||newCode(); ls.set('home',home);
+      space=s1||ls.get('space')||(spaces[0]&&spaces[0].c)||(h?null:newCode());
+      if(space){ addSpace(space); ls.set('space',space); setHash(); }
+      renderSpaces(); watchHome();
+      window.addEventListener('hashchange',()=>{ const c=hashGet('s'); if(c&&c!==space) switchSpace(c); });
     }catch(e){ db=null; toast('온라인 저장소에 연결하지 못했습니다. 지금은 이 기기에만 저장됩니다.'); }
   }
   if(db){
@@ -441,30 +445,57 @@ async function boot(){
   }
 }
 
-/* ---------- groups of trips, one invite link each ---------- */
-let space=null, spaces=[], unsub=null, editSpace=null;
-const hashCode=()=>(location.hash.match(/s=([A-Za-z0-9]{16,64})/)||[])[1]||null;
-function setHash(){ try{ history.replaceState(null,'','#s='+space); }catch(e){ location.hash='s='+space; } }
+/* ---------- my trip list: a private list per person, one invite link per trip ---------- */
+let space=null, spaces=[], unsub=null, home=null, fdoc=null, homeT=null, homeReady=false, homeUnsub=null, homeDirty=false, homeBusy=0;
+const okCode=c=>typeof c==='string'&&/^[A-Za-z0-9]{16,64}$/.test(c);
+const hashGet=k=>(location.hash.match(new RegExp('(?:#|&)'+k+'=([A-Za-z0-9]{16,64})'))||[])[1]||null;
+function setHash(){ if(!space) return; try{ history.replaceState(null,'','#s='+space); }catch(e){ location.hash='s='+space; } }
 function newCode(){ const a=new Uint8Array(18); crypto.getRandomValues(a); return [...a].map(b=>'abcdefghijkmnpqrstuvwxyz23456789'[b%32]).join(''); }
-function loadSpaces(){ try{ spaces=JSON.parse(ls.get('spaces')||'[]').filter(x=>x&&/^[A-Za-z0-9]{16,64}$/.test(x.c)); }catch(e){ spaces=[]; } }
-function saveSpaces(){ ls.set('spaces',JSON.stringify(spaces)); }
-function addSpace(c,n){ let x=spaces.find(y=>y.c===c); if(!x){ x={c,n:n||''}; spaces.push(x); } else if(n) x.n=n; saveSpaces(); return x; }
-const spaceLabel=x=>x.n||('이름 없는 묶음 '+x.c.slice(0,4));
-function renderSpaces(){ $('spaceRow').hidden=!db; $('spaceSel').innerHTML=spaces.map(x=>`<option value="${x.c}"${x.c===space?' selected':''}>${esc(spaceLabel(x))}</option>`).join(''); }
+const cleanList=a=>(Array.isArray(a)?a:[]).filter(x=>x&&okCode(x.c)).map(x=>({c:x.c,n:String(x.n||'').slice(0,80)}));
+function loadSpaces(){ try{ spaces=cleanList(JSON.parse(ls.get('spaces')||'[]')); }catch(e){ spaces=[]; } }
+function pushHome(){ if(!fdoc||!home) return; homeDirty=false; homeBusy++; fdoc(home,'trips/_list').set({items:spaces.map(x=>({c:x.c,n:x.n||''}))}).catch(()=>{}).then(()=>{ homeBusy--; }); }
+function saveSpaces(){ ls.set('spaces',JSON.stringify(spaces)); clearTimeout(homeT); if(homeReady){ homeDirty=true; homeT=setTimeout(pushHome,400); } }
+function addSpace(c,n){ let x=spaces.find(y=>y.c===c); if(!x){ x={c,n:n||''}; spaces.push(x); saveSpaces(); } else if(n&&x.n!==n){ x.n=n; saveSpaces(); } return x; }
+const spaceLabel=x=>x.n||'빈 여행';
+function renderSpaces(){ $('spaceRow').hidden=!db; $('spaceSel').innerHTML=spaces.map(x=>`<option value="${x.c}"${x.c===space?' selected':''}>${esc(spaceLabel(x))}</option>`).join('')||'<option>여행 없음</option>'; }
+function watchHome(){
+  if(homeUnsub){ try{ homeUnsub(); }catch(e){} } homeReady=false; const my=home;
+  homeUnsub=fdoc(home,'trips/_list').onSnapshot(d=>{ if(my!==home||(homeReady&&(homeDirty||homeBusy))) return;
+    const v=d.exists?d.data():null, remote=v&&Array.isArray(v.items)?cleanList(v.items):null, firstEver=ls.get('homeSynced')!==home; homeReady=true;
+    if(!remote) pushHome();
+    else{ let changed=false; const merged=remote.slice();
+      if(firstEver) spaces.forEach(x=>{ if(!merged.find(y=>y.c===x.c)){ merged.push(x); changed=true; } });
+      else if(space&&!merged.find(y=>y.c===space)){ merged.push(spaces.find(y=>y.c===space)||{c:space,n:''}); changed=true; }
+      spaces=merged; ls.set('spaces',JSON.stringify(spaces)); if(changed) pushHome(); }
+    ls.set('homeSynced',home);
+    if(!space) switchSpace(spaces[0]?spaces[0].c:newCode());
+    renderSpaces();
+  },()=>{ if(my!==home) return; homeReady=true; if(!space) switchSpace(spaces[0]?spaces[0].c:newCode()); });
+}
 function subscribe(){
-  if(unsub){ try{ unsub(); }catch(e){} } const my=space; trips={}; ready=false; curId=null; render();
+  if(unsub){ try{ unsub(); }catch(e){} unsub=null; } const my=space; trips={}; ready=false; curId=null; render(); if(!my) return;
   unsub=db.collection('trips').onSnapshot(snap=>{ if(my!==space) return; const next={};
-    snap.docs.forEach(d=>{ const v=d.data(); if(!v) return;
-      if(d.id==='_meta'){ const n=String(v.name||'').slice(0,40), x=addSpace(my); if(n&&x.n!==n){ x.n=n; saveSpaces(); renderSpaces(); } return; }
+    snap.docs.forEach(d=>{ const v=d.data(); if(!v||d.id.charAt(0)==='_') return;
       next[d.id]=(dirty.has(d.id)&&trips[d.id])?trips[d.id]:normalize(JSON.parse(JSON.stringify(v)),d.id); });
     dirty.forEach(id=>{ if(trips[id]&&!next[id]) next[id]=trips[id]; });
-    trips=next; ready=true; pickCur(); render();
+    trips=next; ready=true; nameSpace(); pickCur(); render();
   },()=>{ if(my!==space) return; ready=true; render(); toast('여행을 불러오지 못했습니다. 페이지를 다시 열어 주세요.'); });
 }
-async function switchSpace(c,name){
-  if(c===space) return; for(const id of [...dirty]){ clearTimeout(timers[id]); await flush(id); }
-  space=c; addSpace(c,name); ls.set('space',c); setHash(); day=0; sel=null; if(typeof LKey!=='undefined') LKey=''; renderSpaces(); subscribe();
+function nameSpace(){ if(!space) return; const nm=Object.values(trips).map(t=>t.name).join(', ').slice(0,80), x=addSpace(space); if(nm&&x.n!==nm){ x.n=nm; saveSpaces(); } renderSpaces(); }
+async function switchSpace(c){
+  if(!okCode(c)||c===space) return; for(const id of [...dirty]){ clearTimeout(timers[id]); await flush(id); }
+  space=c; addSpace(c); ls.set('space',c); setHash(); day=0; sel=null; if(typeof LKey!=='undefined') LKey=''; renderSpaces(); subscribe();
 }
+function afterTripDelete(){ if(!db||Object.keys(trips).length) { nameSpace(); return; }
+  const gone=space; spaces=spaces.filter(x=>x.c!==gone); saveSpaces(); switchSpace(spaces[0]?spaces[0].c:newCode()); }
+async function splitTrip(){
+  const t=T(); if(!t||!db||Object.keys(trips).length<2) return; const from=space, oldId=t.id, c=newCode(), copy=JSON.parse(JSON.stringify(t)); copy.id=uid();
+  $('btnSplit').disabled=true;
+  try{ clearTimeout(timers[oldId]); await flush(oldId); await fdoc(c,'trips/'+copy.id).set(copy); await fdoc(from,'trips/'+oldId).delete(); }
+  catch(e){ $('btnSplit').disabled=false; toast('따로 떼지 못했습니다. 연결을 확인하고 다시 눌러 주세요.'); return; }
+  $('btnSplit').disabled=false; delete trips[oldId]; nameSpace(); await switchSpace(c); toast('이 여행을 따로 뗐습니다. 이제 이 여행만의 초대 링크가 있습니다.');
+}
+const _render=render; render=function(){ _render(); const n=Object.keys(trips).length; $('tripSel').hidden=!!db&&n<=1; $('btnSplit').hidden=!(db&&n>1); };
 
 /* ---------- helpers ---------- */
 const T=()=>trips[curId];
@@ -850,19 +881,19 @@ function openTrip(t){
   $('trName').value=t?t.name:''; $('trDest').value=t?t.dest:''; $('trStart').value=t?t.start:today; $('trDays').value=t?t.days:3;
   $('trCur').innerHTML=opts(CURS.map(c=>[c,c==='KRW'?'원화만 사용':c]),t?t.cur:'JPY'); $('trRate').value=t&&t.rate?t.rate:''; $('trMem').value=t?t.members.join(', '):'';
   $('trBak').hidden=!(t&&dl); $('trBak').onclick=async()=>{ try{ await dl.save({filename:(t.name.replace(/[\\/:*?"<>|\[\]]/g,' ').trim()||'여행')+'.json',data:JSON.stringify({app:'trip-note',trip:t})}); toast('백업 파일을 저장했습니다.'); }catch(e){ if(!e||e.code!=='declined') toast('백업 파일을 만들지 못했습니다.'); } };
-  $('trDel').hidden=!t; if(t) armDelete($('trDel'),'여행 삭제',()=>{ removeTrip(t.id); curId=null; pickCur(); $('dlgTrip').close(); render(); });
+  $('trDel').hidden=!t; if(t) armDelete($('trDel'),'여행 삭제',()=>{ removeTrip(t.id); curId=null; pickCur(); $('dlgTrip').close(); render(); afterTripDelete(); });
   $('dlgTrip').showModal();
 }
 $('btnNew').onclick=$('btnNew2').onclick=()=>openTrip(null);
 $('btnEdit').onclick=()=>{ if(T()) openTrip(T()); };
-$('fTrip').addEventListener('submit',ev=>{
+$('fTrip').addEventListener('submit',async ev=>{
   ev.preventDefault(); const days=Math.min(30,Math.max(1,Math.round(+$('trDays').value)||1));
   const v={name:$('trName').value.trim()||'이름 없는 여행',dest:$('trDest').value.trim(),start:$('trStart').value,days,cur:$('trCur').value,rate:+$('trRate').value||0,
     members:[...new Set($('trMem').value.split(/[,、，]/).map(s=>s.trim()).filter(Boolean))].slice(0,12)};
   let t=trips[editTrip];
   if(t){ Object.assign(t,v); t.places.forEach(p=>{if(p.day>days)p.day=days}); t.expenses.forEach(e=>{if(e.day>days)e.day=days}); t.passes.forEach(x=>{ if(x.to>days)x.to=days; if(x.from>days)x.from=days; }); if(day>days)day=0; }
-  else{ t=normalize({...v,places:[],expenses:[],passes:[],back:{}},uid()); trips[t.id]=t; curId=t.id; day=0; ls.set('cur',curId); }
-  save(t); $('dlgTrip').close(); render();
+  else{ if(db&&Object.keys(trips).length) await switchSpace(newCode()); t=normalize({...v,places:[],expenses:[],passes:[],back:{}},uid()); trips[t.id]=t; curId=t.id; day=0; ls.set('cur',curId); }
+  save(t); $('dlgTrip').close(); render(); if(db) nameSpace();
 });
 $('tripSel').addEventListener('change',ev=>{ if(trips[ev.target.value]){ curId=ev.target.value; day=0; sel=null; ls.set('cur',curId); render(); } });
 $('days').addEventListener('click',ev=>{ const b=ev.target.closest('[data-day]'); if(!b) return; day=+b.dataset.day; sel=null; render(); });
@@ -884,22 +915,17 @@ $('plFind').onclick=async()=>{ const t=T(), nm=$('plName').value.trim(); if(!t||
   const g=(await geocode([nm],t.dest))[0]; $('plFind').disabled=false;
   if(g&&typeof g.lat==='number'){ $('plLL').value=`${g.lat}, ${g.lng}`; $('plFindMsg').textContent='찾았습니다. 저장을 누르세요.'; } else $('plFindMsg').textContent='찾지 못했습니다. 지도에서 직접 찍어 주세요.'; };
 $('spaceSel').addEventListener('change',ev=>switchSpace(ev.target.value));
-$('btnSpNew').onclick=()=>{ editSpace=null; $('dlgSpaceH').textContent='새 묶음'; $('spName').value=''; $('dlgSpace').showModal(); };
-$('btnSpEdit').onclick=()=>{ editSpace=space; $('dlgSpaceH').textContent='묶음 이름'; const x=spaces.find(y=>y.c===space); $('spName').value=x&&x.n||''; $('dlgSpace').showModal(); };
-$('fSpace').addEventListener('submit',async ev=>{
-  ev.preventDefault(); const n=$('spName').value.trim().slice(0,40); if(!n) return; $('dlgSpace').close();
-  if(!editSpace) await switchSpace(newCode(),n); else { addSpace(space,n); renderSpaces(); }
-  try{ await db.doc('trips/_meta').set({name:n}); }catch(e){ toast('묶음 이름을 저장하지 못했습니다. 이 기기에서만 보입니다.'); }
-  if(!editSpace) toast(`"${n}" 묶음을 만들었습니다. 친구 초대 링크로 같이 쓸 사람을 부르세요.`);
-});
-$('btnShare').onclick=()=>{ const x=spaces.find(y=>y.c===space); $('shHint').textContent=`이 링크를 받은 사람은 "${x?spaceLabel(x):''}" 묶음의 여행을 모두 보고 고칠 수 있습니다. 다른 묶음은 보이지 않습니다.`; $('shLink').value=location.href.split('#')[0]+'#s='+space; $('dlgShare').showModal(); $('shLink').select(); };
+$('btnSplit').onclick=splitTrip;
+$('btnHome').onclick=()=>{ $('hmLink').value=location.href.split('#')[0]+'#h='+home; $('dlgHome').showModal(); $('hmLink').select(); };
+$('hmCopy').onclick=()=>{ let p; try{ p=navigator.clipboard.writeText($('hmLink').value); }catch(e){ p=Promise.reject(e); } p.then(()=>toast('링크를 복사했습니다.'),()=>{ $('hmLink').select(); toast('복사하지 못했습니다. 링크를 길게 눌러 직접 복사해 주세요.'); }); };
+$('btnShare').onclick=()=>{ const n=Object.keys(trips).length, t=T(); $('shHint').textContent=n>1?`이 링크에는 여행 ${n}개가 함께 들어 있어서, 받은 사람은 ${n}개를 모두 보고 고칠 수 있습니다. 하나만 보내려면 먼저 "이 여행만 따로 떼기"를 누르세요.`:`이 링크를 받은 사람은 "${t?t.name:'이 여행'}"만 보고 고칠 수 있습니다. 내 다른 여행은 보이지 않습니다.`; $('shLink').value=location.href.split('#')[0]+'#s='+space; $('dlgShare').showModal(); $('shLink').select(); };
 $('shCopy').onclick=()=>{ let p; try{ p=navigator.clipboard.writeText($('shLink').value); }catch(e){ p=Promise.reject(e); } p.then(()=>toast('링크를 복사했습니다.'),()=>{ $('shLink').select(); toast('복사하지 못했습니다. 링크를 길게 눌러 직접 복사해 주세요.'); }); };
 $('btnImp').onclick=()=>{ $('imFile').value=''; $('imText').value=''; $('dlgImp').showModal(); };
 $('fImp').addEventListener('submit',async ev=>{
   ev.preventDefault(); let txt=$('imText').value.trim(); const f=$('imFile').files[0];
   try{ if(f) txt=await f.text(); const j=JSON.parse(txt); const list=Array.isArray(j.trips)?j.trips:[j.trip||j];
     const ok=list.filter(x=>x&&typeof x==='object'&&Array.isArray(x.places)); if(!ok.length) throw new Error('shape');
-    ok.forEach(x=>{ const t=normalize(JSON.parse(JSON.stringify(x)),uid()); trips[t.id]=t; curId=t.id; save(t); });
+    for(const x of ok){ if(db&&Object.keys(trips).length) await switchSpace(newCode()); const t=normalize(JSON.parse(JSON.stringify(x)),uid()); trips[t.id]=t; curId=t.id; save(t); if(db) nameSpace(); }
     day=0; ls.set('cur',curId); $('dlgImp').close(); render(); toast(`여행 ${ok.length}개를 가져왔습니다.`);
   }catch(e){ toast('백업 파일을 읽지 못했습니다. 이 앱에서 받은 .json 파일인지 확인해 주세요.'); }
 });
